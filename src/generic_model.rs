@@ -133,7 +133,7 @@ impl<T: na::RealField + Clone> GenericModel<T> {
 }
 
 macro_rules! remap_impl {
-    ($src:expr, $map0:expr, $map1:expr, $($img_type:ident => ($inner_type:ident, $default_value:expr)),*) => {
+    ($src:expr_2021, $map0:expr_2021, $map1:expr_2021, $($img_type:ident => ($inner_type:ident, $default_value:expr_2021)),*) => {
         match $src {
             $(
                 DynamicImage::$img_type(img) => {
