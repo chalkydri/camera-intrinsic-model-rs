@@ -1,8 +1,28 @@
 use super::generic_model::*;
 
+use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer};
 use nalgebra as na;
 use rayon::prelude::*;
 
+/// Returns xmap and ymap for remaping
+///
+/// # Arguments
+///
+/// * `camera_model` - any camera model
+/// * `projection_mat` - new camera matrix for the undistorted image
+/// * `new_w_h` - new image width and height for the undistorted image
+/// * `rotation` - Optional rotation, normally for stereo rectify
+///
+/// # Examples
+///
+/// ```
+/// use camera_intrinsic_model::*;
+/// let model = model_from_json("data/eucm0.json");
+/// let new_w_h = 1024;
+/// let p = model.estimate_new_camera_matrix_for_undistort(0.0, Some((new_w_h, new_w_h)));
+/// let (xmap, ymap) = model.init_undistort_map(&p, (new_w_h, new_w_h), None);
+/// // let remaped = remap(&img, &xmap, &ymap);
+/// ```
 pub fn init_undistort_map(
     camera_model: &dyn CameraModel<f64>,
     projection_mat: &na::Matrix3<f64>,
@@ -25,7 +45,7 @@ pub fn init_undistort_map(
         .into_par_iter()
         .flat_map(|y| {
             (0..new_w_h.0)
-                .into_par_iter()
+                .into_iter()
                 .map(|x| {
                     rmat_inv * na::Vector3::new((x as f64 - cx) / fx, (y as f64 - cy) / fy, 1.0)
                 })
@@ -34,7 +54,7 @@ pub fn init_undistort_map(
         .collect();
     let p2ds = camera_model.project(&p3ds);
     let (xvec, yvec): (Vec<f32>, Vec<f32>) = p2ds
-        .par_iter()
+        .iter()
         .map(|xy| {
             if let Some(xy) = xy {
                 (xy[0] as f32, xy[1] as f32)
@@ -48,6 +68,140 @@ pub fn init_undistort_map(
     (xmap, ymap)
 }
 
+#[inline]
+fn interpolate_bilinear_weight(x: f32, y: f32) -> (u32, u32) {
+    if x < 0.0 || x > 65535.0 {
+        panic!("x not in [0-65535]");
+    }
+    if y < 0.0 || y > 65535.0 {
+        panic!("y not in [0-65535]");
+    }
+    const UPPER: f32 = u8::MAX as f32;
+    let x_weight = (UPPER * (x.ceil() - x)) as u32;
+    let y_weight = (UPPER * (y.ceil() - y)) as u32;
+    // 0-255
+    (x_weight, y_weight)
+}
+
+pub fn compute_for_fast_remap(
+    xmap: &na::DMatrix<f32>,
+    ymap: &na::DMatrix<f32>,
+) -> Vec<(u32, u32, u32, u32)> {
+    let xy_pos_weight_vec: Vec<_> = xmap
+        .iter()
+        .zip(ymap.iter())
+        .map(|(&x, &y)| {
+            let (xw, yw) = interpolate_bilinear_weight(x, y);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            (x0, y0, xw, yw)
+        })
+        .collect();
+    xy_pos_weight_vec
+}
+
+fn reinterpret_vec(input: Vec<[u8; 3]>) -> Vec<u8> {
+    let len = input.len() * 3;
+    let capacity = input.capacity() * 3;
+    let ptr = input.as_ptr() as *mut u8;
+    std::mem::forget(input); // prevent dropping original vec
+    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+}
+
+pub fn fast_remap(
+    img: &DynamicImage,
+    new_w_h: (u32, u32),
+    xy_pos_weight_vec: &[(u32, u32, u32, u32)],
+) -> DynamicImage {
+    let remaped = match img {
+        DynamicImage::ImageLuma8(image_buffer) => {
+            let val: Vec<u8> = xy_pos_weight_vec
+                .par_iter()
+                .map(|&(x0, y0, xw0, yw0)| {
+                    let p00 = unsafe { image_buffer.unsafe_get_pixel(x0, y0)[0] as u32 };
+                    let p10 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0)[0] as u32 };
+                    let p01 = unsafe { image_buffer.unsafe_get_pixel(x0, y0 + 1)[0] as u32 };
+                    let p11 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0 + 1)[0] as u32 };
+                    let xw1 = 255 - xw0;
+                    let yw1 = 255 - yw0;
+                    const UPPER_UPPER: u32 = 255 * 255;
+                    let p =
+                        ((p00 * xw0 * yw0 + p10 * xw1 * yw0 + p01 * xw0 * yw1 + p11 * xw1 * yw1)
+                            / UPPER_UPPER) as u8;
+                    p
+                })
+                .collect();
+            let img = GrayImage::from_vec(new_w_h.0, new_w_h.1, val).unwrap();
+            DynamicImage::ImageLuma8(img)
+        }
+        DynamicImage::ImageRgb8(image_buffer) => {
+            let val: Vec<[u8; 3]> = xy_pos_weight_vec
+                .par_iter()
+                .map(|&(x0, y0, xw0, yw0)| {
+                    let p00 = unsafe { image_buffer.unsafe_get_pixel(x0, y0) };
+                    let p10 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0) };
+                    let p01 = unsafe { image_buffer.unsafe_get_pixel(x0, y0 + 1) };
+                    let p11 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0 + 1) };
+                    let mut v = [0, 1, 2];
+                    v.iter_mut().for_each(|i| {
+                        let xw1 = 255 - xw0;
+                        let yw1 = 255 - yw0;
+                        let c = *i as usize;
+                        const UPPER_UPPER: u32 = 255 * 255;
+                        *i = ((p00.0[c] as u32 * xw0 * yw0
+                            + p10.0[c] as u32 * xw1 * yw0
+                            + p01.0[c] as u32 * xw0 * yw1
+                            + p11.0[c] as u32 * xw1 * yw1)
+                            / UPPER_UPPER) as u8;
+                    });
+                    v
+                })
+                .collect();
+            let img = ImageBuffer::from_vec(new_w_h.0, new_w_h.1, reinterpret_vec(val)).unwrap();
+            DynamicImage::ImageRgb8(img)
+        }
+        DynamicImage::ImageLuma16(image_buffer) => {
+            let val: Vec<u16> = xy_pos_weight_vec
+                .par_iter()
+                .map(|&(x0, y0, xw0, yw0)| {
+                    let p00 = unsafe { image_buffer.unsafe_get_pixel(x0, y0)[0] as u32 };
+                    let p10 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0)[0] as u32 };
+                    let p01 = unsafe { image_buffer.unsafe_get_pixel(x0, y0 + 1)[0] as u32 };
+                    let p11 = unsafe { image_buffer.unsafe_get_pixel(x0 + 1, y0 + 1)[0] as u32 };
+                    let xw1 = 255 - xw0;
+                    let yw1 = 255 - yw0;
+                    const UPPER_UPPER: u32 = 255 * 255;
+                    let p =
+                        ((p00 * xw0 * yw0 + p10 * xw1 * yw0 + p01 * xw0 * yw1 + p11 * xw1 * yw1)
+                            / UPPER_UPPER) as u16;
+                    p
+                })
+                .collect();
+            let img = ImageBuffer::from_vec(new_w_h.0, new_w_h.1, val).unwrap();
+            DynamicImage::ImageLuma16(img)
+        }
+        _ => panic!("Only mono8, mono16, and rgb8 support fast remap."),
+    };
+    remaped
+}
+
+/// Returns xmap and ymap for remaping
+///
+/// # Arguments
+///
+/// * `camera_model` - any camera model
+/// * `balance` - [0-1] zero means no black margin
+/// * `new_image_w_h` - optional new image width and height, default using the original w, h
+///
+/// # Examples
+///
+/// ```
+/// use camera_intrinsic_model::*;
+/// let model = model_from_json("data/eucm0.json");
+/// let new_w_h = 1024;
+/// let p = model.estimate_new_camera_matrix_for_undistort(0.0, Some((new_w_h, new_w_h)));
+/// let (xmap, ymap) = model.init_undistort_map(&p, (new_w_h, new_w_h), None);
+/// ```
 pub fn estimate_new_camera_matrix_for_undistort(
     camera_model: &dyn CameraModel<f64>,
     balance: f64,
@@ -102,6 +256,41 @@ pub fn estimate_new_camera_matrix_for_undistort(
     out
 }
 
+/// Returns xmap and ymap for remaping
+///
+/// # Arguments
+///
+/// * `camera_model` - any camera model
+/// * `balance` - [0-1] zero means no black margin
+/// * `new_image_w_h` - optional new image width and height, default using the original w, h
+///
+/// # Examples
+///
+/// ```
+/// use camera_intrinsic_model::*;
+/// use nalgebra as na;
+/// let model0 = model_from_json("data/eucm0.json");
+/// let model1 = model_from_json("data/eucm1.json");
+/// let tvec = na::Vector3::new(
+///     -0.10098947190325333,
+///     -0.0020811599784744455,
+///     -0.0012888359197775197,
+/// );
+/// let quat = na::Quaternion::new(
+///     0.9997158799903332,
+///     0.02382966001551074,
+///     -0.00032454324393309654,
+///     0.00044863167728445325,
+/// );
+/// let rvec = na::UnitQuaternion::from_quaternion(quat).scaled_axis();
+/// let (r0, r1, p) = stereo_rectify(&model0, &model1, &rvec, &tvec, None);
+/// let image_w_h = (
+///     model0.width().round() as u32,
+///     model0.height().round() as u32,
+/// );
+/// let (xmap0, ymap0) = model0.init_undistort_map(&p, image_w_h, Some(r0));
+/// let (xmap1, ymap1) = model1.init_undistort_map(&p, image_w_h, Some(r1));
+/// ```
 pub fn stereo_rectify(
     camera_model0: &GenericModel<f64>,
     camera_model1: &GenericModel<f64>,
